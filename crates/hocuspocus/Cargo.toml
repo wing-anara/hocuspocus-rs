@@ -1,0 +1,49 @@
+[package]
+name = "hocuspocus"
+description = "Idiomatic Rust reimplementation of the Hocuspocus Yjs collaboration server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+yrs.workspace = true
+tokio.workspace = true
+axum.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# optional extension backends
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+redis = { version = "0.27", features = ["tokio-comp", "aio"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+criterion = { version = "0.5", features = ["async_tokio"] }
+mimalloc = "0.1"
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:rusqlite"]
+redis-scaling = ["dep:redis", "dep:uuid"]
+webhook = ["dep:reqwest", "dep:hmac", "dep:sha2", "dep:hex"]
+full = ["sqlite", "redis-scaling", "webhook"]
+
+[[bench]]
+name = "throughput"
+harness = false

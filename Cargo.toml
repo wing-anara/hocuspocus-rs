@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/hocuspocus"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/winglee/hocuspocus-rs"
+rust-version = "1.80"
+
+[workspace.dependencies]
+yrs = { version = "0.27", features = ["sync"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+bytes = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dashmap = "6"
+parking_lot = "0.12"
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
