@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -38,6 +38,19 @@ pub struct ServerShared {
     creating: DashMap<String, Arc<Mutex<()>>>,
     next_conn_id: AtomicU64,
     next_socket_id: AtomicU64,
+    /// Live count of open WebSocket sockets, maintained by the socket handler so
+    /// the cap can shed before the handshake (and thus before auth).
+    active_connections: AtomicUsize,
+}
+
+/// Decrements the active-socket counter on drop, so the count is correct on
+/// every exit path (over-cap close, error, or normal disconnect).
+struct ConnectionGuard(Arc<ServerShared>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl ServerShared {
@@ -65,6 +78,11 @@ impl ServerShared {
     /// Total number of resident documents.
     pub fn documents_count(&self) -> usize {
         self.documents.len()
+    }
+
+    /// Live count of open WebSocket sockets.
+    pub fn active_connection_count(&self) -> usize {
+        self.active_connections.load(Ordering::Relaxed)
     }
 
     /// Programmatically apply an update to a document (server-side edit),
@@ -139,6 +157,7 @@ impl ServerBuilder {
                 creating: DashMap::new(),
                 next_conn_id: AtomicU64::new(1),
                 next_socket_id: AtomicU64::new(1),
+                active_connections: AtomicUsize::new(0),
             }),
         }
     }
@@ -223,6 +242,17 @@ async fn ws_handler(
     }
     meta.remote_ip = Some(remote.ip().to_string());
 
+    // Shed over-capacity connections before completing the handshake, so a
+    // connection storm never reaches authentication/persistence work.
+    let max = shared.config.max_connections;
+    if max > 0 && shared.active_connections.load(Ordering::Relaxed) >= max {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "server at capacity",
+        )
+            .into_response();
+    }
+
     match WebSocketUpgrade::from_request_parts(&mut parts, &shared).await {
         Ok(ws) => ws.on_upgrade(move |socket| handle_socket(socket, shared, meta)),
         Err(_) => {
@@ -265,6 +295,10 @@ fn percent_decode(s: &str) -> String {
 }
 
 async fn handle_socket(socket: WebSocket, shared: Arc<ServerShared>, meta: RequestMeta) {
+    // Count this socket for the duration of its life; the guard decrements on
+    // every exit path so the cap reflects live connections.
+    shared.active_connections.fetch_add(1, Ordering::Relaxed);
+    let _conn_guard = ConnectionGuard(shared.clone());
     let socket_id = format!("ws-{}", shared.next_socket_id.fetch_add(1, Ordering::Relaxed));
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<OutMsg>(shared.config.outbound_capacity);

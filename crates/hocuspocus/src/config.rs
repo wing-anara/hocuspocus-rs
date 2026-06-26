@@ -36,6 +36,11 @@ pub struct Configuration {
     /// far behind is evicted (and reconnects/resyncs), bounding server memory
     /// under broadcast load.
     pub outbound_capacity: usize,
+    /// Maximum concurrent WebSocket connections per instance. Excess upgrades
+    /// are rejected before the handshake completes — i.e. before any
+    /// authentication or persistence work — so a connection storm sheds cheaply.
+    /// `0` disables the cap.
+    pub max_connections: usize,
 }
 
 impl Default for Configuration {
@@ -54,6 +59,7 @@ impl Default for Configuration {
             max_pending_documents: 100,
             gc: true,
             outbound_capacity: 2048,
+            max_connections: 0,
         }
     }
 }
