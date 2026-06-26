@@ -6,7 +6,7 @@ members = ["crates/hocuspocus"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/winglee/hocuspocus-rs"
+repository = "https://github.com/wing-anara/hocuspocus-rs"
 rust-version = "1.80"
 
 [workspace.dependencies]
