@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use redis::AsyncCommands;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use yrs::sync::SyncMessage;
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
@@ -72,7 +72,9 @@ pub struct RedisScaling {
     prefix: String,
     lock_timeout_ms: u64,
     client: redis::Client,
-    pub_conn: Mutex<redis::aio::MultiplexedConnection>,
+    // MultiplexedConnection is cheaply cloneable and safe for concurrent use,
+    // so publishes/locks clone it instead of serialising through a Mutex.
+    pub_conn: redis::aio::MultiplexedConnection,
     message_prefix: Vec<u8>,
     locks: DashMap<String, String>,
 }
@@ -88,7 +90,7 @@ impl RedisScaling {
             prefix: config.prefix,
             lock_timeout_ms: config.lock_timeout_ms,
             client,
-            pub_conn: Mutex::new(pub_conn),
+            pub_conn,
             locks: DashMap::new(),
         }))
     }
@@ -101,15 +103,23 @@ impl RedisScaling {
         format!("{}:{}:lock", self.prefix, document_name)
     }
 
-    async fn publish(&self, document_name: &str, frame: &[u8]) {
+    /// Publish a frame to peers without blocking the caller. Document-actor
+    /// hooks (`on_change`, `on_awareness_update`, ...) call this on every edit;
+    /// awaiting the Redis round-trip here serialised the actor's frame
+    /// processing (~one RTT per keystroke), so the replication publish is fired
+    /// on a detached task. Yjs updates and awareness are order-independent, so
+    /// out-of-order delivery to peers is safe.
+    fn publish(&self, document_name: &str, frame: &[u8]) {
         let mut payload = Vec::with_capacity(self.message_prefix.len() + frame.len());
         payload.extend_from_slice(&self.message_prefix);
         payload.extend_from_slice(frame);
         let channel = self.channel(document_name);
-        let mut conn = self.pub_conn.lock().await;
-        if let Err(e) = conn.publish::<_, _, ()>(channel, payload).await {
-            warn!("redis publish failed: {e}");
-        }
+        let mut conn = self.pub_conn.clone();
+        tokio::spawn(async move {
+            if let Err(e) = conn.publish::<_, _, ()>(channel, payload).await {
+                warn!("redis publish failed: {e}");
+            }
+        });
     }
 }
 
@@ -234,13 +244,13 @@ impl Extension for RedisScaling {
             txn.state_vector()
         };
         let sync_frame = encode_sync_frame(payload.document_name, &SyncMessage::SyncStep1(sv));
-        self.publish(payload.document_name, &sync_frame).await;
+        self.publish(payload.document_name, &sync_frame);
 
         use yrs::encoding::write::Write;
         let mut e = EncoderV1::new();
         e.write_string(payload.document_name);
         e.write_var(3u64); // MessageType::QueryAwareness
-        self.publish(payload.document_name, &e.to_vec()).await;
+        self.publish(payload.document_name, &e.to_vec());
         Ok(())
     }
 
@@ -252,7 +262,7 @@ impl Extension for RedisScaling {
             payload.document_name,
             &SyncMessage::Update(payload.update.to_vec()),
         );
-        self.publish(payload.document_name, &frame).await;
+        self.publish(payload.document_name, &frame);
         Ok(())
     }
 
@@ -265,7 +275,7 @@ impl Extension for RedisScaling {
         e.write_string(payload.document_name);
         e.write_var(1u64); // MessageType::Awareness
         e.write_buf(payload.update);
-        self.publish(payload.document_name, &e.to_vec()).await;
+        self.publish(payload.document_name, &e.to_vec());
         Ok(())
     }
 
@@ -279,7 +289,7 @@ impl Extension for RedisScaling {
         e.write_string(document_name);
         e.write_var(6u64); // MessageType::BroadcastStateless
         e.write_string(payload);
-        self.publish(document_name, &e.to_vec()).await;
+        self.publish(document_name, &e.to_vec());
         Ok(())
     }
 
@@ -289,17 +299,16 @@ impl Extension for RedisScaling {
         // retried, matching the TS `SkipFurtherHooksError` behaviour.
         let key = self.lock_key(payload.document_name);
         let token = uuid::Uuid::new_v4().to_string();
-        let mut conn = self.pub_conn.lock().await;
+        let mut conn = self.pub_conn.clone();
         let acquired: Option<String> = redis::cmd("SET")
             .arg(&key)
             .arg(&token)
             .arg("NX")
             .arg("PX")
             .arg(self.lock_timeout_ms)
-            .query_async(&mut *conn)
+            .query_async(&mut conn)
             .await
             .unwrap_or(None);
-        drop(conn);
         if acquired.is_some() {
             self.locks.insert(key, token);
             Ok(())
@@ -314,8 +323,8 @@ impl Extension for RedisScaling {
             let script = redis::Script::new(
                 "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
             );
-            let mut conn = self.pub_conn.lock().await;
-            let _: Result<i64, _> = script.key(&key).arg(token).invoke_async(&mut *conn).await;
+            let mut conn = self.pub_conn.clone();
+            let _: Result<i64, _> = script.key(&key).arg(token).invoke_async(&mut conn).await;
         }
         Ok(())
     }
