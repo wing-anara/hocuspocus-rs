@@ -123,6 +123,12 @@ pub struct Document {
     first_dirty_at: Option<Instant>,
     last_change_at: Option<Instant>,
     last_origin: Origin,
+    // A debounced store runs off-actor (spawned) so its slow I/O never blocks
+    // client-frame processing. `storing` gates against overlapping stores; the
+    // spawned task reports completion back over `store_result_*`.
+    storing: bool,
+    store_result_tx: mpsc::UnboundedSender<bool>,
+    store_result_rx: mpsc::UnboundedReceiver<bool>,
 }
 
 impl Document {
@@ -154,6 +160,7 @@ impl Document {
 
         let awareness = Awareness::new(doc);
         let (tx, rx) = mpsc::unbounded_channel();
+        let (store_result_tx, store_result_rx) = mpsc::unbounded_channel();
         let actor = Document {
             name: name.clone(),
             awareness,
@@ -164,6 +171,9 @@ impl Document {
             first_dirty_at: None,
             last_change_at: None,
             last_origin: Origin::Local,
+            storing: false,
+            store_result_tx,
+            store_result_rx,
         };
         tokio::spawn(actor.run());
         Ok(DocumentHandle { name, tx })
@@ -182,9 +192,25 @@ impl Document {
                         None => break,
                     }
                 }
-                _ = sleep_until_opt(deadline) => {
-                    self.run_store().await;
+                Some(ok) = self.store_result_rx.recv() => {
+                    self.storing = false;
+                    if !ok {
+                        // Persist failed; re-arm the debounce timer to retry.
+                        self.mark_dirty(self.last_origin);
+                    }
                     if self.maybe_unload().await { break; }
+                }
+                _ = sleep_until_opt(deadline) => {
+                    if self.connections.is_empty() {
+                        // No clients to keep responsive: persist inline so the
+                        // unload that follows sees a clean document.
+                        self.run_store().await;
+                        if self.maybe_unload().await { break; }
+                    } else {
+                        // Clients connected: persist off-actor so the slow store
+                        // I/O doesn't stall frame processing (and typing).
+                        self.spawn_store();
+                    }
                 }
             }
         }
@@ -192,7 +218,7 @@ impl Document {
     }
 
     fn store_deadline(&self) -> Option<Instant> {
-        if !self.dirty {
+        if !self.dirty || self.storing {
             return None;
         }
         let debounce = self.server.config.debounce;
@@ -665,6 +691,51 @@ impl Document {
         self.last_origin = origin;
     }
 
+    /// Persist off-actor: snapshot the state, then run the (slow) store hooks on
+    /// a spawned task so client-frame processing keeps flowing. Only one store
+    /// runs at a time; edits that land mid-store re-dirty for the next tick.
+    fn spawn_store(&mut self) {
+        if !self.dirty || self.storing {
+            return;
+        }
+        let state = {
+            let doc = self.awareness.doc();
+            let txn = doc.transact();
+            txn.encode_state_as_update_v1(&StateVector::default())
+        };
+        self.storing = true;
+        self.dirty = false;
+        self.first_dirty_at = None;
+        self.last_change_at = None;
+
+        let extensions = self.server.extensions.clone();
+        let name = self.name.clone();
+        let clients_count = self.connections.len();
+        let result_tx = self.store_result_tx.clone();
+        tokio::spawn(async move {
+            let payload = DocumentPayload {
+                document_name: &name,
+                clients_count,
+            };
+            let mut ok = true;
+            for ext in &extensions {
+                if let Err(e) = ext.on_store_document(&state, &payload).await {
+                    warn!(document = %name, "on_store_document failed: {e}");
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                for ext in &extensions {
+                    if let Err(e) = ext.after_store_document(&payload).await {
+                        warn!(document = %name, "after_store_document failed: {e}");
+                    }
+                }
+            }
+            let _ = result_tx.send(ok);
+        });
+    }
+
     /// Persist the document via `on_store_document`/`after_store_document`
     /// hooks. Errors leave the document dirty so the next tick retries.
     async fn run_store(&mut self) {
@@ -707,6 +778,11 @@ impl Document {
     /// true if the actor should exit.
     async fn maybe_unload(&mut self) -> bool {
         if !self.connections.is_empty() {
+            return false;
+        }
+        if self.storing {
+            // A background store is in flight; stay resident until it reports
+            // back (its result re-runs this check).
             return false;
         }
         if !self.server.config.unload_immediately && self.dirty {
