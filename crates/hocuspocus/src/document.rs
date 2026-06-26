@@ -129,7 +129,17 @@ pub struct Document {
     storing: bool,
     store_result_tx: mpsc::UnboundedSender<bool>,
     store_result_rx: mpsc::UnboundedReceiver<bool>,
+    // Coalesced fan-out: a batch of already-queued updates is applied to the doc
+    // one by one, then broadcast to clients as a SINGLE merged update. `base` is
+    // the doc state vector captured before the batch's first change; the merged
+    // frame is the diff from it. Cuts a burst of N edits to 1 broadcast per peer.
+    broadcast_base: Option<StateVector>,
+    broadcast_pending: bool,
 }
+
+/// Upper bound on commands drained into one coalescing batch, so a flood can't
+/// starve the store/unload timers.
+const MAX_COALESCE_BATCH: usize = 512;
 
 impl Document {
     /// Spawn and load a new document actor, returning its handle. Runs the
@@ -174,6 +184,8 @@ impl Document {
             storing: false,
             store_result_tx,
             store_result_rx,
+            broadcast_base: None,
+            broadcast_pending: false,
         };
         tokio::spawn(actor.run());
         Ok(DocumentHandle { name, tx })
@@ -186,7 +198,26 @@ impl Document {
                 cmd = self.rx.recv() => {
                     match cmd {
                         Some(cmd) => {
-                            let exit = self.handle_command(cmd).await;
+                            // Drain everything already queued and process it as a
+                            // batch; updates are applied per-command but their
+                            // fan-out is coalesced into one broadcast by the
+                            // trailing flush. No artificial waiting — only what
+                            // was already in the mailbox is merged.
+                            let mut batch = vec![cmd];
+                            while batch.len() < MAX_COALESCE_BATCH {
+                                match self.rx.try_recv() {
+                                    Ok(c) => batch.push(c),
+                                    Err(_) => break,
+                                }
+                            }
+                            let mut exit = false;
+                            for c in batch {
+                                if self.handle_command(c).await {
+                                    exit = true;
+                                    break;
+                                }
+                            }
+                            self.flush_broadcast();
                             if exit { break; }
                         }
                         None => break,
@@ -427,9 +458,18 @@ impl Document {
         true
     }
 
-    /// Apply an update to the document and broadcast the resulting change to
-    /// all connections, then fire `on_change` and schedule persistence.
+    /// Apply an update to the document and fire `on_change`, then queue a
+    /// coalesced broadcast. The client fan-out is deferred to
+    /// [`Self::flush_broadcast`] so a drained batch of updates collapses to a
+    /// single merged frame per peer (instead of one frame per edit).
     async fn apply_and_broadcast(&mut self, update: &[u8], origin: Origin, _exclude: Option<u64>) {
+        // Snapshot the state vector before the batch's first change so the flush
+        // can emit one merged diff covering the whole batch.
+        let base_before = if self.broadcast_base.is_none() {
+            Some(self.awareness.doc().transact().state_vector())
+        } else {
+            None
+        };
         let computed = {
             let doc = self.awareness.doc();
             let mut txn = doc.transact_mut_with(yrs::Origin::from(origin));
@@ -450,17 +490,14 @@ impl Document {
         if computed.is_empty() {
             return;
         }
-        // Broadcast to every connection (clients dedupe their own echo). The
-        // frame is built once and shared by refcount across recipients.
-        let body = encode_sync(&yrs::sync::SyncMessage::Update(computed.clone()));
-        self.broadcast_with(|addr| {
-            OutgoingMessage::new(addr)
-                .sync()
-                .write_sync_payload(&body)
-                .into_bytes()
-        });
+        if let Some(base) = base_before {
+            self.broadcast_base = Some(base);
+        }
+        self.broadcast_pending = true;
         self.mark_dirty(origin);
-        // on_change hooks (errors are non-fatal).
+        // on_change hooks (errors are non-fatal). Replication publishes are
+        // fire-and-forget and order-independent, so this stays per-update; a
+        // peer node coalesces the frames again on its own ingress.
         let payload = ChangePayload {
             document_name: &self.name,
             update: &computed,
@@ -472,6 +509,33 @@ impl Document {
                 warn!(document = %self.name, "on_change failed: {e}");
             }
         }
+    }
+
+    /// Flush the coalesced broadcast: emit everything applied since the batch's
+    /// base state vector as one merged update, shared by refcount across peers.
+    fn flush_broadcast(&mut self) {
+        if !self.broadcast_pending {
+            return;
+        }
+        self.broadcast_pending = false;
+        let Some(base) = self.broadcast_base.take() else {
+            return;
+        };
+        let merged = {
+            let doc = self.awareness.doc();
+            let txn = doc.transact();
+            txn.encode_diff_v1(&base)
+        };
+        if merged.is_empty() {
+            return;
+        }
+        let body = encode_sync(&yrs::sync::SyncMessage::Update(merged));
+        self.broadcast_with(|addr| {
+            OutgoingMessage::new(addr)
+                .sync()
+                .write_sync_payload(&body)
+                .into_bytes()
+        });
     }
 
     async fn handle_awareness(&mut self, mut frame: IncomingFrame<'_>, origin: Origin) {
